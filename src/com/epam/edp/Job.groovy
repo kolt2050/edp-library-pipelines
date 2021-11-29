@@ -62,6 +62,8 @@ class Job {
     def crApiGroup
     def dnsWildcard
     def manualApproveStageTimeout
+    def autodeployTimeout
+    def autodeployLatestVersions
     def triggerJobName
     def triggerJobWait
     def triggerJobPropogate
@@ -113,12 +115,8 @@ class Job {
                 if (!getParameterValue("RELEASE_NAME")) {
                     script.error("[JENKINS][ERROR] Parameter RELEASE_NAME is mandatory to be specified, please check configuration of job")
                 }
-                if (!getParameterValue("DEFAULT_BRANCH")) {
-                    script.error("[JENKINS][ERROR] Parameter DEFAULT_BRANCH is mandatory to be specified, please check configuration of job")
-                }
                 this.releaseName = getParameterValue("RELEASE_NAME").toLowerCase()
-                def defaultBranch = getParameterValue("DEFAULT_BRANCH")
-                this.releaseFromCommitId = getParameterValue("COMMIT_ID", "origin/" + defaultBranch)
+                this.releaseFromCommitId = getParameterValue("COMMIT_ID", "HEAD")
             case JobType.DEPLOY.value:
                 this.maxOfParallelDeployApps = getParameterValue("MAX_PARALLEL_APPS", 5)
                 this.maxOfParallelDeployServices = getParameterValue("MAX_PARALLEL_SERVICES", 3)
@@ -141,6 +139,8 @@ class Job {
         this.ciProject = getParameterValue("CI_NAMESPACE")
         this.deployTimeout = getParameterValue("DEPLOY_TIMEOUT", "300s")
         this.manualApproveStageTimeout = getParameterValue("MANUAL_APPROVE_TIMEOUT", "10")
+        this.autodeployTimeout = getParameterValue("AUTODEPLOY_TIMEOUT", "5")
+        this.autodeployLatestVersions = getParameterValue("AUTODEPLOY_LATEST_VERSIONS", false)
 
         stageContent.applications.each() { item ->
             stageCodebasesList.add(item.name)
@@ -221,13 +221,35 @@ class Job {
         return tags
     }
 
+    def generateInputDataForDeployJob() {
+        if (autodeployLatestVersions == "true") {
+            try {
+                script.timeout(time: autodeployTimeout, unit: 'MINUTES') {
+                    setCodebaseVersionFromUser()
+                }
+            } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException ex) {
+                if (ex.getCauses()[0].getUser().toString() == 'SYSTEM') {
+                    script.println("[JENKINS][DEBUG] AUTO_DEPLOY: STARTED")
+                    codebasesList.each() { codebase ->
+                        codebase.version = LATEST_TAG
+                        script.println("[JENKINS][DEBUG] ${codebase.name.toUpperCase().replaceAll("-", "_")}_VERSION: ${codebase.latest}")
+                    }
+                } else {
+                    throw ex
+                }
+            }
+        } else {
+            setCodebaseVersionFromUser()
+        }
+    }
+
     def generateCodebaseVersionsInputData() {
         def autoDeploy = getParameterValue("AUTODEPLOY", false)
         if (autoDeploy != null && autoDeploy.toBoolean()) {
             setCodebaseVersionsAutomatically()
             return
         }
-        setCodebaseVersionsManually()
+        generateInputDataForDeployJob()
     }
 
     private def setCodebaseVersionsAutomatically() {
