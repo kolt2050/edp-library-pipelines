@@ -239,7 +239,7 @@ class Job {
                 }
             }
         } else {
-            generateInputDataForDeployJob()
+            setCodebaseVersionFromUser()
         }
     }
 
@@ -270,7 +270,7 @@ class Job {
         }
     }
 
-    private def setCodebaseVersionsManually() {
+    private def setCodebaseVersionFromUser() {
         codebasesList.each() { codebase ->
             deployJobParameters.add(script.choice(choices: "${codebase.sortedTags.join('\n')}", description: '', name: "${codebase.name.toUpperCase().replaceAll("-", "_")}_VERSION"))
         }
