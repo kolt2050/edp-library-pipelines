@@ -239,7 +239,7 @@ class Job {
                 }
             }
         } else {
-            setCodebaseVersionFromUser()
+            generateInputDataForDeployJob()
         }
     }
 
