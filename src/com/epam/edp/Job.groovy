@@ -62,6 +62,8 @@ class Job {
     def crApiGroup
     def dnsWildcard
     def manualApproveStageTimeout
+    def autodeployTimeout
+    def autodeployLatestVersions
     def triggerJobName
     def triggerJobWait
     def triggerJobPropogate
@@ -137,6 +139,8 @@ class Job {
         this.ciProject = getParameterValue("CI_NAMESPACE")
         this.deployTimeout = getParameterValue("DEPLOY_TIMEOUT", "300s")
         this.manualApproveStageTimeout = getParameterValue("MANUAL_APPROVE_TIMEOUT", "10")
+        this.autodeployTimeout = getParameterValue("AUTODEPLOY_TIMEOUT", "5")
+        this.autodeployLatestVersions = getParameterValue("AUTODEPLOY_LATEST_VERSIONS", false)
 
         stageContent.applications.each() { item ->
             stageCodebasesList.add(item.name)
@@ -217,205 +221,226 @@ class Job {
         return tags
     }
 
-    def generateCodebaseVersionsInputData() {
-        def autoDeploy = getParameterValue("AUTODEPLOY", false)
-        if (autoDeploy != null && autoDeploy.toBoolean()) {
-            setCodebaseVersionsAutomatically()
-            return
+    def generateInputDataForDeployJob() {
+        if (autodeployLatestVersions == "true") {
+            try {
+                script.timeout(time: autodeployTimeout, unit: 'MINUTES') {
+                    setCodebaseVersionFromUser()
+                }
+            } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException ex) {
+                if (ex.getCauses()[0].getUser().toString() == 'SYSTEM') {
+                    script.println("[JENKINS][DEBUG] AUTO_DEPLOY: STARTED")
+                    codebasesList.each() { codebase ->
+                        codebase.version = LATEST_TAG
+                        script.println("[JENKINS][DEBUG] ${codebase.name.toUpperCase().replaceAll("-", "_")}_VERSION: ${codebase.latest}")
+                    }
+                } else {
+                    throw ex
+                }
+            }
+        } else {
+            setCodebaseVersionFromUser()
         }
-        setCodebaseVersionsManually()
-    }
 
-    private def setCodebaseVersionsAutomatically() {
-        def deployCodebase = getParameterValue("CODEBASE_VERSION", "")
-        if (!deployCodebase?.trim()) {
-            script.error("[JENKINS][ERROR] Codebase versions must be passed to job.")
-        }
-        script.println("[JENKINS][INFO] Used codebase to autodeploy: ${deployCodebase}")
-
-        def parsedDeployCodebase = new JsonSlurper().parseText(deployCodebase)
-        codebasesList.each() { codebase ->
-            if (codebase.name != parsedDeployCodebase.codebase) {
-                codebase.version = "No deploy"
+        def generateCodebaseVersionsInputData() {
+            def autoDeploy = getParameterValue("AUTODEPLOY", false)
+            if (autoDeploy != null && autoDeploy.toBoolean()) {
+                setCodebaseVersionsAutomatically()
                 return
             }
-            codebase.version = parsedDeployCodebase.tag
-            script.println("[JENKINS][DEBUG] ${codebase.name.toUpperCase().replaceAll("-", "_")}_VERSION: ${codebase.version}")
+            generateInputDataForDeployJob()
         }
-    }
 
-    private def setCodebaseVersionsManually() {
-        codebasesList.each() { codebase ->
-            deployJobParameters.add(script.choice(choices: "${codebase.sortedTags.join('\n')}", description: '', name: "${codebase.name.toUpperCase().replaceAll("-", "_")}_VERSION"))
-        }
-        userInputImagesToDeploy = script.input id: 'userInput', message: 'Provide the following information', parameters: deployJobParameters
-        script.println("[JENKINS][DEBUG] USERS_INPUT_IMAGES_TO_DEPLOY: ${userInputImagesToDeploy}")
-        codebasesList.each() { codebase ->
-            if (userInputImagesToDeploy instanceof java.lang.String) {
-                codebase.version = userInputImagesToDeploy
-                if (codebase.version.startsWith(LATEST_TAG))
-                    codebase.version = LATEST_TAG
-                if (codebase.version.startsWith(STABLE_TAG))
-                    codebase.version = STABLE_TAG
-            } else {
-                userInputImagesToDeploy.each() { item ->
-                    if (item.value.startsWith(LATEST_TAG)) {
-                        userInputImagesToDeploy.put(item.key, LATEST_TAG)
-                    }
-                    if (item.value.startsWith(STABLE_TAG)) {
-                        userInputImagesToDeploy.put(item.key, STABLE_TAG)
-                    }
+        private def setCodebaseVersionsAutomatically() {
+            def deployCodebase = getParameterValue("CODEBASE_VERSION", "")
+            if (!deployCodebase?.trim()) {
+                script.error("[JENKINS][ERROR] Codebase versions must be passed to job.")
+            }
+            script.println("[JENKINS][INFO] Used codebase to autodeploy: ${deployCodebase}")
+
+            def parsedDeployCodebase = new JsonSlurper().parseText(deployCodebase)
+            codebasesList.each() { codebase ->
+                if (codebase.name != parsedDeployCodebase.codebase) {
+                    codebase.version = "No deploy"
+                    return
                 }
-                codebase.version = userInputImagesToDeploy["${codebase.name.toUpperCase().replaceAll("-", "_")}_VERSION"]
-            }
-            codebase.version = codebase.version ? codebase.version : LATEST_TAG
-        }
-    }
-
-    def getBuildUser() {
-        script.wrap([$class: 'BuildUser']) {
-            def userId = getParameterValue("BUILD_USER_ID")
-            return userId
-        }
-    }
-
-    def setBuildResult(result) {
-        script.currentBuild.result = result
-    }
-
-    def setDisplayName(displayName) {
-        script.currentBuild.displayName = displayName
-    }
-
-    def setDescription(description, addDescription = false) {
-        if (addDescription && script.currentBuild.description?.trim())
-            script.currentBuild.description = "${script.currentBuild.description}\r\n${description}"
-        else
-            script.currentBuild.description = description
-    }
-
-    void printDebugInfo(context) {
-        def debugOutput = ""
-        context.keySet().each { key ->
-            debugOutput = debugOutput + "${key}=${context["${key}"]}\n"
-        }
-        script.println("[JENKINS][DEBUG] Pipeline's context:\n${debugOutput}")
-    }
-
-    def runStage(stageName, context, runStageName = null) {
-        script.stage(runStageName ? runStageName : stageName) {
-            if (context.codebase) {
-                context.factory.getStage(stageName.toLowerCase(),
-                        context.codebase.config.build_tool.toLowerCase(),
-                        context.codebase.config.type).run(context)
-            } else {
-                run(stageName, context, runStageName)
+                codebase.version = parsedDeployCodebase.tag
+                script.println("[JENKINS][DEBUG] ${codebase.name.toUpperCase().replaceAll("-", "_")}_VERSION: ${codebase.version}")
             }
         }
-    }
 
-    def run(stageName, context, runStageName = null) {
-        def stage = context.factory.getStage(stageName.toLowerCase())
-        if (stage.getClass() == AutomationTests) {
-            stage.run(context, runStageName)
-            return
+        private def setCodebaseVersionsManually() {
+            codebasesList.each() { codebase ->
+                deployJobParameters.add(script.choice(choices: "${codebase.sortedTags.join('\n')}", description: '', name: "${codebase.name.toUpperCase().replaceAll("-", "_")}_VERSION"))
+            }
+            userInputImagesToDeploy = script.input id: 'userInput', message: 'Provide the following information', parameters: deployJobParameters
+            script.println("[JENKINS][DEBUG] USERS_INPUT_IMAGES_TO_DEPLOY: ${userInputImagesToDeploy}")
+            codebasesList.each() { codebase ->
+                if (userInputImagesToDeploy instanceof java.lang.String) {
+                    codebase.version = userInputImagesToDeploy
+                    if (codebase.version.startsWith(LATEST_TAG))
+                        codebase.version = LATEST_TAG
+                    if (codebase.version.startsWith(STABLE_TAG))
+                        codebase.version = STABLE_TAG
+                } else {
+                    userInputImagesToDeploy.each() { item ->
+                        if (item.value.startsWith(LATEST_TAG)) {
+                            userInputImagesToDeploy.put(item.key, LATEST_TAG)
+                        }
+                        if (item.value.startsWith(STABLE_TAG)) {
+                            userInputImagesToDeploy.put(item.key, STABLE_TAG)
+                        }
+                    }
+                    codebase.version = userInputImagesToDeploy["${codebase.name.toUpperCase().replaceAll("-", "_")}_VERSION"]
+                }
+                codebase.version = codebase.version ? codebase.version : LATEST_TAG
+            }
         }
-        stage.run(context)
-    }
 
-    def failStage(stageName, exception) {
-        script.println "[JENKINS][ERROR] Trace: ${exception.getStackTrace().collect { it.toString() }.join('\n')}"
-        script.updateGitlabCommitStatus name: 'Jenkins', state: "failed"
-        script.error("[JENKINS][ERROR] Stage ${stageName} has been failed\r\n Exception - ${exception}")
-    }
-
-    private def getBuildCause() {
-        return platform.getJsonPathValue("build", "${this.deployProject}-deploy-pipeline-${script.BUILD_NUMBER}", ".spec.triggeredBy[0].message")
-    }
-
-    def getTokenFromAdminConsole() {
-        def clientSecret = getSecretField("admin-console-client", "clientSecret")
-        def clientUsername = getSecretField("admin-console-client", "username")
-        def basicAuth = "${clientUsername}:${clientSecret}".bytes.encodeBase64().toString()
-        def keycloakUrl = platform.getJsonPathValue("edpcomponent", "main-keycloak", ".spec.url")
-        def realmName = platform.getJsonPathValue("keycloakrealm", "main", ".spec.realmName")
-
-        def response = script.httpRequest url: "${keycloakUrl}/realms/${realmName}/protocol/openid-connect/token",
-                httpMode: 'POST',
-                contentType: 'APPLICATION_FORM',
-                requestBody: "grant_type=client_credentials",
-                customHeaders: [[name: 'Authorization', value: "Basic ${basicAuth}"]],
-                consoleLogResponseBody: true
-
-        return new JsonSlurperClassic()
-                .parseText(response.content)
-                .access_token
-    }
-
-    def getCodebaseFromAdminConsole(codebaseNames = null, tmpToken = null) {
-        def accessToken = tmpToken ?: getTokenFromAdminConsole()
-        def url = getCodebaseRequestUrl(codebaseNames)
-        def response = script.httpRequest url: "${url}",
-                httpMode: 'GET',
-                customHeaders: [[name: 'Authorization', value: "Bearer ${accessToken}"]],
-                consoleLogResponseBody: true
-        return new JsonSlurperClassic().parseText(response.content)
-    }
-
-    def getCodebaseRequestUrl(codebaseName = null) {
-        if (codebaseName.getClass() == java.lang.String) {
-            return "${adminConsoleUrl}/api/v1/edp/codebase/${codebaseName}"
+        def getBuildUser() {
+            script.wrap([$class: 'BuildUser']) {
+                def userId = getParameterValue("BUILD_USER_ID")
+                return userId
+            }
         }
-        if (codebaseName.getClass() == java.util.ArrayList) {
-            def codebases = codebaseName.join(",")
-            return "${adminConsoleUrl}/api/v1/edp/codebase?codebases=${codebases}"
+
+        def setBuildResult(result) {
+            script.currentBuild.result = result
         }
-        return "${adminConsoleUrl}/api/v1/edp/codebase"
-    }
 
-    def getStageFromAdminConsole(pipelineName, stageName, pipelineType, tmpToken = null) {
-        def accessToken = tmpToken ?: getTokenFromAdminConsole()
+        def setDisplayName(displayName) {
+            script.currentBuild.displayName = displayName
+        }
 
-        def url = "${adminConsoleUrl}" + "/api/v1/edp/${pipelineType}/${pipelineName}/stage/${stageName}"
-        def response = script.httpRequest url: "${url}",
-                httpMode: 'GET',
-                customHeaders: [[name: 'Authorization', value: "Bearer ${accessToken}"]],
-                consoleLogResponseBody: true
+        def setDescription(description, addDescription = false) {
+            if (addDescription && script.currentBuild.description?.trim())
+                script.currentBuild.description = "${script.currentBuild.description}\r\n${description}"
+            else
+                script.currentBuild.description = description
+        }
 
-        return new JsonSlurperClassic().parseText(response.content)
-    }
+        void printDebugInfo(context) {
+            def debugOutput = ""
+            context.keySet().each { key ->
+                debugOutput = debugOutput + "${key}=${context["${key}"]}\n"
+            }
+            script.println("[JENKINS][DEBUG] Pipeline's context:\n${debugOutput}")
+        }
 
-    def getPipelineFromAdminConsole(pipelineName, pipelineType, tmpToken = null) {
-        def accessToken = tmpToken ?: getTokenFromAdminConsole()
+        def runStage(stageName, context, runStageName = null) {
+            script.stage(runStageName ? runStageName : stageName) {
+                if (context.codebase) {
+                    context.factory.getStage(stageName.toLowerCase(),
+                            context.codebase.config.build_tool.toLowerCase(),
+                            context.codebase.config.type).run(context)
+                } else {
+                    run(stageName, context, runStageName)
+                }
+            }
+        }
 
-        def url = "${adminConsoleUrl}" + "/api/v1/edp/${pipelineType}/${pipelineName}"
-        def response = script.httpRequest url: "${url}",
-                httpMode: 'GET',
-                customHeaders: [[name: 'Authorization', value: "Bearer ${accessToken}"]],
-                consoleLogResponseBody: true
+        def run(stageName, context, runStageName = null) {
+            def stage = context.factory.getStage(stageName.toLowerCase())
+            if (stage.getClass() == AutomationTests) {
+                stage.run(context, runStageName)
+                return
+            }
+            stage.run(context)
+        }
 
-        return new JsonSlurperClassic().parseText(response.content)
-    }
+        def failStage(stageName, exception) {
+            script.println "[JENKINS][ERROR] Trace: ${exception.getStackTrace().collect { it.toString() }.join('\n')}"
+            script.updateGitlabCommitStatus name: 'Jenkins', state: "failed"
+            script.error("[JENKINS][ERROR] Stage ${stageName} has been failed\r\n Exception - ${exception}")
+        }
 
-    private def getCredentialsFromSecret(name) {
-        def credentials = [:]
-        credentials['username'] = getSecretField(name, 'username')
-        credentials['password'] = getSecretField(name, 'password')
-        return credentials
-    }
+        private def getBuildCause() {
+            return platform.getJsonPathValue("build", "${this.deployProject}-deploy-pipeline-${script.BUILD_NUMBER}", ".spec.triggeredBy[0].message")
+        }
 
-    private def getSecretField(name, field) {
-        return new String(platform.getJsonPathValue("secret", name, ".data.\\\\${field}").decodeBase64())
-    }
+        def getTokenFromAdminConsole() {
+            def clientSecret = getSecretField("admin-console-client", "clientSecret")
+            def clientUsername = getSecretField("admin-console-client", "username")
+            def basicAuth = "${clientUsername}:${clientSecret}".bytes.encodeBase64().toString()
+            def keycloakUrl = platform.getJsonPathValue("edpcomponent", "main-keycloak", ".spec.url")
+            def realmName = platform.getJsonPathValue("keycloakrealm", "main", ".spec.realmName")
 
-    private def setTriggerJobParameter() {
-        def triggerJobParameterEnvValue = getParameterValue("TRIGGER_JOB_PARAMETERS")
-        if (!triggerJobParameterEnvValue)
-            return
+            def response = script.httpRequest url: "${keycloakUrl}/realms/${realmName}/protocol/openid-connect/token",
+                    httpMode: 'POST',
+                    contentType: 'APPLICATION_FORM',
+                    requestBody: "grant_type=client_credentials",
+                    customHeaders: [[name: 'Authorization', value: "Basic ${basicAuth}"]],
+                    consoleLogResponseBody: true
 
-        def parsedTriggerJobParameter = new JsonSlurperClassic().parseText(triggerJobParameterEnvValue)
-        for (param in parsedTriggerJobParameter) {
-            this.triggerJobParameters.push(script.string(name: param.name, value: param.value))
+            return new JsonSlurperClassic()
+                    .parseText(response.content)
+                    .access_token
+        }
+
+        def getCodebaseFromAdminConsole(codebaseNames = null, tmpToken = null) {
+            def accessToken = tmpToken ?: getTokenFromAdminConsole()
+            def url = getCodebaseRequestUrl(codebaseNames)
+            def response = script.httpRequest url: "${url}",
+                    httpMode: 'GET',
+                    customHeaders: [[name: 'Authorization', value: "Bearer ${accessToken}"]],
+                    consoleLogResponseBody: true
+            return new JsonSlurperClassic().parseText(response.content)
+        }
+
+        def getCodebaseRequestUrl(codebaseName = null) {
+            if (codebaseName.getClass() == java.lang.String) {
+                return "${adminConsoleUrl}/api/v1/edp/codebase/${codebaseName}"
+            }
+            if (codebaseName.getClass() == java.util.ArrayList) {
+                def codebases = codebaseName.join(",")
+                return "${adminConsoleUrl}/api/v1/edp/codebase?codebases=${codebases}"
+            }
+            return "${adminConsoleUrl}/api/v1/edp/codebase"
+        }
+
+        def getStageFromAdminConsole(pipelineName, stageName, pipelineType, tmpToken = null) {
+            def accessToken = tmpToken ?: getTokenFromAdminConsole()
+
+            def url = "${adminConsoleUrl}" + "/api/v1/edp/${pipelineType}/${pipelineName}/stage/${stageName}"
+            def response = script.httpRequest url: "${url}",
+                    httpMode: 'GET',
+                    customHeaders: [[name: 'Authorization', value: "Bearer ${accessToken}"]],
+                    consoleLogResponseBody: true
+
+            return new JsonSlurperClassic().parseText(response.content)
+        }
+
+        def getPipelineFromAdminConsole(pipelineName, pipelineType, tmpToken = null) {
+            def accessToken = tmpToken ?: getTokenFromAdminConsole()
+
+            def url = "${adminConsoleUrl}" + "/api/v1/edp/${pipelineType}/${pipelineName}"
+            def response = script.httpRequest url: "${url}",
+                    httpMode: 'GET',
+                    customHeaders: [[name: 'Authorization', value: "Bearer ${accessToken}"]],
+                    consoleLogResponseBody: true
+
+            return new JsonSlurperClassic().parseText(response.content)
+        }
+
+        private def getCredentialsFromSecret(name) {
+            def credentials = [:]
+            credentials['username'] = getSecretField(name, 'username')
+            credentials['password'] = getSecretField(name, 'password')
+            return credentials
+        }
+
+        private def getSecretField(name, field) {
+            return new String(platform.getJsonPathValue("secret", name, ".data.\\\\${field}").decodeBase64())
+        }
+
+        private def setTriggerJobParameter() {
+            def triggerJobParameterEnvValue = getParameterValue("TRIGGER_JOB_PARAMETERS")
+            if (!triggerJobParameterEnvValue)
+                return
+
+            def parsedTriggerJobParameter = new JsonSlurperClassic().parseText(triggerJobParameterEnvValue)
+            for (param in parsedTriggerJobParameter) {
+                this.triggerJobParameters.push(script.string(name: param.name, value: param.value))
+            }
         }
     }
-}
